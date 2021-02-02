@@ -24,6 +24,7 @@ import pandas as pd
 import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 import tensorflow_probability as tfp
+from uncertainty_baselines.datasets import augmix
 tfd = tfp.distributions
 
 IMAGE_SIZE = 224
@@ -489,16 +490,20 @@ class ImageNetInput(object):
           # Hard target in the first epoch!
           self.mixup_params['mixup_coeff'] = tf.ones(
               [self.ensemble_size, self.mixup_params['num_classes']])
+        adaptive_mixup_fn = functools.partial(
+            augmix.adaptive_mixup, batch_size, self.mixup_params),
         dataset = dataset.map(
-            functools.partial(adaptive_mixup, batch_size, self.mixup_params),
-            num_parallel_calls=tf.data.experimental.AUTOTUNE)
+            adaptive_mixup_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
       else:
+        aug_params = {
+            'mixup_alpha': self.mixup_alpha,
+            'same_mix_weight_per_batch': self.same_mix_weight_per_batch,
+            'use_truncated_beta': self.use_truncated_beta,
+            'use_random_shuffling': self.use_random_shuffling,
+        }
+        mixup_fn = functools.partial(augmix.mixup, batch_size, aug_params)
         dataset = dataset.map(
-            functools.partial(mixup, batch_size, self.mixup_alpha,
-                              self.same_mix_weight_per_batch,
-                              self.use_truncated_beta,
-                              self.use_random_shuffling),
-            num_parallel_calls=tf.data.experimental.AUTOTUNE)
+            mixup_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
@@ -512,102 +517,6 @@ class ImageNetInput(object):
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
     return dataset
-
-
-def mixup(batch_size, alpha, same_mix_weight_per_batch, use_truncated_beta,
-          use_random_shuffling, images, labels):
-  """Applies Mixup regularization to a batch of images and labels.
-
-  [1] Hongyi Zhang, Moustapha Cisse, Yann N. Dauphin, David Lopez-Paz
-    Mixup: Beyond Empirical Risk Minimization.
-    ICLR'18, https://arxiv.org/abs/1710.09412
-
-  Arguments:
-    batch_size: The input batch size for images and labels.
-    alpha: Float that controls the strength of Mixup regularization.
-    same_mix_weight_per_batch: whether to use the same mix coef over the batch.
-    use_truncated_beta: whether to sample from Beta_[0,1](alpha, alpha) or from
-       the truncated distribution Beta_[1/2, 1](alpha, alpha).
-    use_random_shuffling: Whether to pair images by random shuffling
-      (default is a deterministic pairing by reversing the batch).
-    images: A batch of images of shape [batch_size, ...]
-    labels: A batch of labels of shape [batch_size, num_classes]
-
-  Returns:
-    A tuple of (images, labels) with the same dimensions as the input with
-    Mixup regularization applied.
-  """
-  if same_mix_weight_per_batch:
-    mix_weight = ed.Beta(alpha, alpha, sample_shape=[1, 1])
-    mix_weight = tf.tile(mix_weight, [batch_size, 1])
-  else:
-    mix_weight = ed.Beta(alpha, alpha, sample_shape=[batch_size, 1])
-
-  if use_truncated_beta:
-    mix_weight = tf.maximum(mix_weight, 1. - mix_weight)
-
-  images_mix_weight = tf.reshape(mix_weight, [batch_size, 1, 1, 1])
-  images_mix_weight = tf.cast(images_mix_weight, images.dtype)
-
-  if not use_random_shuffling:
-  # Mixup on a single batch is implemented by taking a weighted sum with the
-  # same batch in reverse.
-    mixup_index = tf.reverse(tf.range(batch_size), axis=[0])
-  else:
-    mixup_index = tf.random.shuffle(tf.range(batch_size))
-
-  images_mix = (
-      images * images_mix_weight + tf.gather(images, mixup_index) *
-      (1. - images_mix_weight))
-  mix_weight = tf.cast(mix_weight, labels.dtype)
-  labels_mix = labels * mix_weight + tf.gather(labels,
-                                               mixup_index) * (1. - mix_weight)
-  return images_mix, labels_mix
-
-
-def adaptive_mixup(batch_size, mixup_params, images, labels):
-  """Applies CAMixup regularization to a batch of images and labels.
-
-  Arguments:
-    batch_size: The input batch size for images and labels.
-    mixup_params: `Dict` to store the hparams of mixup.
-    images: A batch of images of shape [batch_size, ...]
-    labels: A batch of labels of shape [batch_size, num_classes]
-
-  Returns:
-    A tuple of (images, labels) with the same dimensions as the input with
-    Mixup regularization applied.
-  """
-  ensemble_size = mixup_params.get('ensemble_size', 1)
-  mixup_coeff = mixup_params['mixup_coeff']
-  scalar_labels = tf.argmax(labels, axis=1)
-  alpha = tf.gather(mixup_coeff, scalar_labels, axis=-1)
-
-  # Need to filter out elements in alpha which equal to 0.
-  greater_zero_indicator = tf.cast(alpha > 0, alpha.dtype)
-  less_one_indicator = tf.cast(alpha < 1, alpha.dtype)
-  valid_alpha_indicator = tf.cast(
-      greater_zero_indicator * less_one_indicator, tf.bool)
-
-  dummy_alpha = 0.1 * tf.ones_like(alpha)
-  sampled_alpha = tf.where(valid_alpha_indicator, alpha, dummy_alpha)
-  mix_weight = tfd.Beta(sampled_alpha, sampled_alpha).sample()
-  mix_weight = tf.where(valid_alpha_indicator, mix_weight, alpha)
-  mix_weight = tf.reshape(mix_weight, [ensemble_size * batch_size, 1])
-  mix_weight = tf.clip_by_value(mix_weight, 0, 1)
-  mix_weight = tf.maximum(mix_weight, 1. - mix_weight)
-  images_mix_weight = tf.reshape(mix_weight,
-                                 [ensemble_size * batch_size, 1, 1, 1])
-
-  # Mixup on a single batch is implemented by taking a weighted sum with the
-  # same batch in reverse.
-  images = tf.tile(images, [ensemble_size, 1, 1, 1])
-  labels = tf.tile(labels, [ensemble_size, 1])
-  images_mix_weight = tf.cast(images_mix_weight, images.dtype)
-  images_mix = (
-      images * images_mix_weight + images[::-1] * (1. - images_mix_weight))
-  labels_mix = labels * mix_weight + labels[::-1] * (1. - mix_weight)
-  return images_mix, labels_mix
 
 
 def load_corrupted_test_dataset(corruption_name,
