@@ -26,6 +26,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 import efficientnet_be_model  # local file import
 import utils  # local file import
+import uncertainty_baselines as ub
 import uncertainty_metrics as um
 
 # ~312.78 steps per epoch for 4x4 TPU; per_core_batch_size=128; 350 epochs;
@@ -138,7 +139,8 @@ def main(argv):
     warmup_step = steps_per_epoch * 5
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         scaled_lr, decay_steps, decay_rate=0.97, staircase=True)
-    learning_rate = utils.WarmupDecaySchedule(lr_schedule, warmup_step)
+    learning_rate = ub.schedules.AddWarmupDecaySchedule(
+        lr_schedule, warmup_step)
     optimizer = tf.keras.optimizers.RMSprop(
         learning_rate, rho=0.9, momentum=0.9, epsilon=0.001)
 
